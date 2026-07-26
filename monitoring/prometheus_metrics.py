@@ -36,12 +36,14 @@ registry = CollectorRegistry()
 # Request metrics
 # ---------------------------------------------------------------------------
 
+
 REQUEST_COUNT = Counter(
     "intelliview_http_requests_total",
     "Total HTTP requests",
     ["method", "path", "status"],
     registry=registry,
 )
+REDIS_HEALTH = Gauge("redis_health", "Redis connection health status")
 
 REQUEST_DURATION = Histogram(
     "intelliview_http_request_duration_seconds",
@@ -251,10 +253,11 @@ def get_metrics_text() -> bytes:
     """Return current metrics in Prometheus text exposition format."""
     return generate_latest(registry)
 
+
 def get_session_metrics():
     return {
         "created": SESSIONS_CREATED._value.get(),
         "completed": SESSIONS_COMPLETED._value.get(),
         "failed": SESSIONS_FAILED._value.get(),
         "active": SESSIONS_ACTIVE._value.get(),
-    }    
+    }

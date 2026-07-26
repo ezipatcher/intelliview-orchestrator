@@ -16,8 +16,8 @@ import json
 import io
 import logging
 import re
-import time as _time
 import time
+import time as _time
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from uuid import uuid4
@@ -39,9 +39,21 @@ from config import (
     MAX_REQUEST_BODY_BYTES,
 )
 from database.db import engine, get_db
-from database.models import Base, InterviewSession
+from database.models import Base, Candidate, InterviewSession
 from monitoring.dashboard_api import create_dashboard_routes
 from monitoring.metrics_collector import MetricsCollector
+from monitoring.prometheus_metrics import (
+    POSTGRES_HEALTH,
+    REDIS_HEALTH,
+    REQUEST_COUNT,
+    REQUEST_DURATION,
+    WORKER_ACTIVE_TASKS,
+    WORKER_CAPACITY,
+    WORKER_HEARTBEAT_AGE_SECONDS,
+    WORKERS_HEALTHY,
+    WORKERS_REGISTERED,
+    WORKERS_UNHEALTHY,
+)
 from monitoring.websocket_manager import ws_manager
 from orchestrator import http_cache
 from orchestrator.candidate_manager import CandidateManager
@@ -66,6 +78,8 @@ from workers.bias_auditor import BiasAuditor
 # Configure logging after imports so startup messages are structured.
 configure_logging()
 logger = logging.getLogger(__name__)
+
+APP_START_TIME = datetime.now(timezone.utc)
 
 
 @asynccontextmanager
@@ -325,6 +339,63 @@ class SessionStatusResponse(BaseModel):
     updated_at: str | None = None
 
 
+class ReportCandidate(BaseModel):
+    candidate_id: str
+    name: str
+    email: str
+
+
+class ReportInterviewSummary(BaseModel):
+    start_time: str | None = None
+    end_time: str | None = None
+    duration_minutes: float | None = None
+
+
+class ReportQuestion(BaseModel):
+    question_id: str
+    text: str
+    answer: str | None = None
+    score: float | None = None
+    feedback: str | None = None
+
+
+class ReportEvaluation(BaseModel):
+    quality: float | None = None
+    accuracy: float | None = None
+    clarity: float | None = None
+
+
+class ReportLLMFeedback(BaseModel):
+    strengths: list[str] = Field(default_factory=list)
+    improvements: list[str] = Field(default_factory=list)
+    recommendation: str | None = None
+    detailed_feedback: str | None = None
+
+
+class ReportRiskAssessment(BaseModel):
+    score: float | None = None
+    classification: str | None = None
+    factors: list[str] = Field(default_factory=list)
+
+
+class ReportMetadata(BaseModel):
+    token_usage: int | None = None
+    estimated_cost_usd: float | None = None
+
+
+class InterviewReportResponse(BaseModel):
+    """Comprehensive final interview report"""
+
+    session_id: str
+    candidate: ReportCandidate
+    interview_summary: ReportInterviewSummary
+    questions: list[ReportQuestion] = Field(default_factory=list)
+    overall_evaluation: ReportEvaluation
+    llm_feedback: ReportLLMFeedback
+    risk_assessment: ReportRiskAssessment
+    metadata: ReportMetadata
+
+
 class TaskStatusResponse(BaseModel):
     """Response model for Celery task status (used by /task-status/{task_id})."""
 
@@ -458,6 +529,18 @@ if ENABLE_PROMETHEUS:
     @app.get("/metrics")
     async def prometheus_metrics():
         """Prometheus metrics endpoint."""
+        # Dynamic check of dependency statuses
+        deps = health_monitor._check_all_dependencies()
+        REDIS_HEALTH.set(1 if deps.get("redis", {}).get("status") == "healthy" else 0)
+        POSTGRES_HEALTH.set(1 if deps.get("postgres", {}).get("status") == "healthy" else 0)
+
+        # Worker status gauges
+        all_workers = worker_registry.get_all_workers()
+        unhealthy = worker_registry.detect_unhealthy_workers()
+        WORKERS_REGISTERED.set(len(all_workers))
+        WORKERS_HEALTHY.set(len(all_workers) - len(unhealthy))
+        WORKERS_UNHEALTHY.set(len(unhealthy))
+
         return _Response(
             content=get_metrics_text(),
             media_type="text/plain; version=0.0.4; charset=utf-8",
