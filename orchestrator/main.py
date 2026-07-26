@@ -11,7 +11,6 @@ Integrates:
 - Worker Registry for node tracking
 - Task Queue integration with Celery
 """
-
 import json
 import io
 import logging
