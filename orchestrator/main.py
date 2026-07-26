@@ -12,6 +12,7 @@ Integrates:
 - Task Queue integration with Celery
 """
 
+import json
 import io
 import logging
 import re
@@ -23,12 +24,13 @@ from uuid import uuid4
 
 from fastapi import Depends, FastAPI, Header, HTTPException, Response
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import StreamingResponse
 from pydantic import BaseModel, Field, field_validator
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.middleware.base import BaseHTTPMiddleware
 from starlette.requests import Request as StarletteRequest
-from monitoring.prometheus_metrics import (REQUEST_COUNT,REQUEST_DURATION,)
+from monitoring.prometheus_metrics import (REQUEST_COUNT, REQUEST_DURATION,)
 
 from config import (
     API_TOKEN,
@@ -58,6 +60,7 @@ from orchestrator.session_manager import SessionManager
 from orchestrator.session_tracker import SessionTracker
 from orchestrator.state_sync import StateSynchronizer
 from orchestrator.worker_registry import WorkerRegistry
+from workers.ai_client import chat_completion
 from workers.bias_auditor import BiasAuditor
 
 # Configure logging after imports so startup messages are structured.
@@ -111,6 +114,8 @@ app = FastAPI(
     version="1.0.0",
     lifespan=lifespan,
 )
+
+
 @app.middleware("http")
 async def prometheus_middleware(request, call_next):
     start = time.perf_counter()
@@ -399,8 +404,6 @@ class CreateTemplateRequest(BaseModel):
     difficulty_distribution: dict[str, float] | None = None
 
 
-@app.get("/health")
-
 # ========== Deep Health & Probe Endpoints ==========
 
 
@@ -454,11 +457,6 @@ if ENABLE_PROMETHEUS:
 
     @app.get("/metrics")
     async def prometheus_metrics():
-        REDIS_HEALTH.set(...)
-        POSTGRES_HEALTH.set(...)
-        WORKERS_REGISTERED.set(...)
-        WORKERS_HEALTHY.set(...)
-        WORKERS_UNHEALTHY.set(...)
         """Prometheus metrics endpoint."""
         return _Response(
             content=get_metrics_text(),
@@ -492,27 +490,10 @@ async def start_interview(
 ):
     """
     Start a new interview session using intelligent scheduling
-
-    Execution flow:
-    1. Create session in database (status: CREATED)
-    2. Cache session in Redis
-    3. Update status to QUEUED
-    4. Use Scheduler to intelligently assign to worker
-    5. Task pushed to Redis queue and/or assigned to specific worker
-
-    Args:
-        request: Interview session request with candidate details
-
-    Returns:
-        InterviewSessionResponse: Created session details with estimated wait time
-
-    Raises:
-        HTTPException: On creation failure
     """
     try:
         logger.info(f"API: Creating interview session for candidate {request.candidate_id}")
 
-        # Parse priority
         priority_map = {
             "low": TaskPriority.LOW,
             "medium": TaskPriority.MEDIUM,
@@ -520,7 +501,6 @@ async def start_interview(
         }
         priority = priority_map.get(request.priority.lower(), TaskPriority.MEDIUM)
 
-        # Create session
         session_id = session_manager.create_session(
             candidate_id=request.candidate_id,
             candidate_name=request.candidate_name,
@@ -529,24 +509,17 @@ async def start_interview(
 
         logger.info(f"Session created: {session_id}")
 
-        # Update status to QUEUED
         session_manager.update_session_status(session_id, session_manager.QUEUED, {"priority": priority.name})
 
-        # Check if system can accept task
         if not scheduler.can_accept_task():
             logger.warning(f"System at capacity, queuing task: {session_id}")
 
-        # Use scheduler to intelligently assign task
         scheduler.schedule_task(session_id, priority=priority)
 
-        # Get estimated wait time
         wait_time = scheduler.get_estimated_wait_time(priority)
 
-        # Invalidate the read caches so the next poll reflects the new
-        # session immediately instead of waiting for the TTL.
         http_cache.invalidate("active-sessions", "session-statistics", "workers", "worker-statistics")
 
-        # Retrieve and return session details
         session_data = session_manager.get_session(session_id)
 
         return InterviewSessionResponse(
@@ -568,24 +541,7 @@ async def get_session_status(
     session_id: str,
     session_db: Session = Depends(get_db),
 ):
-    """
-    Get current status of an interview session
-
-    Retrieves real-time session information including:
-    - Current status (CREATED, QUEUED, PROCESSING, COMPLETED, FAILED)
-    - Risk score if available
-    - Processing node information
-    - Timestamps
-
-    Args:
-        session_id: Interview session identifier
-
-    Returns:
-        SessionStatusResponse: Current session status and details
-
-    Raises:
-        HTTPException: If session not found
-    """
+    """Get current status of an interview session"""
     try:
         logger.debug(f"API: Fetching status for session {session_id}")
 
@@ -613,15 +569,56 @@ async def get_session_status(
         raise HTTPException(status_code=500, detail=f"Error fetching session: {e!s}")
 
 
+@app.get("/interviews/{session_id}/evaluate/stream")
+async def stream_evaluation(session_id: str):
+    """Streams LLM evaluation feedback in real-time via Server-Sent Events (SSE)."""
+    session_data = session_manager.get_session(session_id)
+    if not session_data:
+        raise HTTPException(status_code=404, detail="Session not found")
+
+    answers = session_data.get("answers_provided", [])
+    questions = session_data.get("questions_asked", [])
+
+    messages = [
+        {
+            "role": "system",
+            "content": "You are an expert technical interviewer evaluating a candidate's responses in real-time.",
+        },
+        {
+            "role": "user",
+            "content": f"Session Context:\nQuestions: {json.dumps(questions)}\nAnswers: {json.dumps(answers)}\nProvide incremental evaluation feedback.",
+        },
+    ]
+
+    async def event_generator():
+        try:
+            token_gen = chat_completion(messages=messages, stream=True)
+            if token_gen is None:
+                yield f"data: {json.dumps({'error': 'LLM provider unavailable', 'status': 'FAILED'})}\n\n"
+                return
+
+            for token in token_gen:
+                yield f"data: {json.dumps({'token': token})}\n\n"
+
+            yield f"data: {json.dumps({'status': 'DONE'})}\n\n"
+        except Exception as exc:
+            logger.error(f"Error streaming evaluation for {session_id}: {exc!s}")
+            yield f"data: {json.dumps({'error': str(exc), 'status': 'FAILED'})}\n\n"
+
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={
+            "Cache-Control": "no-cache",
+            "Connection": "keep-alive",
+            "X-Accel-Buffering": "no",
+        },
+    )
+
+
 @app.get("/session-status/{session_id}/risk-report")
 async def get_session_risk_report(session_id: str, format: str = "json"):
-    """
-    Get a full detailed risk report for a session, as JSON or downloadable PDF.
-
-    Args:
-        session_id: Interview session identifier
-        format: "json" (default) or "pdf"
-    """
+    """Get a full detailed risk report for a session, as JSON or downloadable PDF."""
     try:
         session_data = session_manager.get_session(session_id)
 
@@ -696,15 +693,7 @@ async def get_task_status(
     task_id: str,
     session_db: Session = Depends(get_db),
 ):
-    """
-    Get the status of a Celery task by its ID.
-
-    Args:
-        task_id: Celery task identifier (returned by the scheduler).
-
-    Returns:
-        TaskStatusResponse: Current task status and result if available.
-    """
+    """Get the status of a Celery task by its ID."""
     try:
         from workers.celery_app import celery_app
 
@@ -730,14 +719,7 @@ async def get_task_status(
 async def get_active_sessions(
     session_db: Session = Depends(get_db),
 ):
-    """
-    Get all currently active sessions
-
-    Returns sessions in states: CREATED, QUEUED, PROCESSING
-
-    Returns:
-        dict: List of active sessions with brief details
-    """
+    """Get all currently active sessions"""
     try:
         active = session_tracker.get_active_sessions()
         return {"count": len(active), "sessions": active}
@@ -749,15 +731,7 @@ async def get_active_sessions(
 @app.get("/completed-sessions")
 @http_cache.cached("completed-sessions", ttl=3)
 async def get_completed_sessions(limit: int = 100):
-    """
-    Get recently completed sessions
-
-    Args:
-        limit: Maximum number of sessions to retrieve (default: 100)
-
-    Returns:
-        dict: List of completed sessions with results
-    """
+    """Get recently completed sessions"""
     try:
         completed = session_tracker.get_completed_sessions(limit=limit)
         return {"count": len(completed), "sessions": completed}
@@ -771,15 +745,7 @@ async def get_stuck_sessions(
     timeout_minutes: int = 30,
     session_db: Session = Depends(get_db),
 ):
-    """
-    Get sessions that appear to be stuck in PROCESSING
-
-    Args:
-        timeout_minutes: Timeout threshold in minutes (default: 30)
-
-    Returns:
-        dict: List of stuck sessions
-    """
+    """Get sessions that appear to be stuck in PROCESSING"""
     try:
         stuck = session_tracker.get_stuck_sessions(timeout_minutes=timeout_minutes)
         return {
@@ -800,18 +766,7 @@ async def get_stuck_sessions(
 async def get_session_statistics(
     session_db: Session = Depends(get_db),
 ):
-    """
-    Get comprehensive session statistics
-
-    Returns statistics including:
-    - Total sessions by status
-    - Average processing duration
-    - Risk score distribution
-    - High-risk session count
-
-    Returns:
-        dict: Session statistics
-    """
+    """Get comprehensive session statistics"""
     try:
         return session_tracker.get_session_statistics()
     except Exception as e:
@@ -823,12 +778,7 @@ async def get_session_statistics(
 async def get_worker_distribution(
     session_db: Session = Depends(get_db),
 ):
-    """
-    Get distribution of sessions across worker nodes
-
-    Returns:
-        dict: Worker node -> session count mapping
-    """
+    """Get distribution of sessions across worker nodes"""
     try:
         distribution = session_tracker.get_worker_distribution()
         return {"workers": distribution, "total_active": sum(distribution.values())}
@@ -843,16 +793,7 @@ async def get_high_risk_sessions(
     limit: int = 50,
     session_db: Session = Depends(get_db),
 ):
-    """
-    Get high-risk completed sessions
-
-    Args:
-        threshold: Risk score threshold (0-1, default: 0.8)
-        limit: Maximum sessions to return (default: 50)
-
-    Returns:
-        dict: List of high-risk sessions
-    """
+    """Get high-risk completed sessions"""
     try:
         high_risk = session_tracker.get_high_risk_sessions(threshold=threshold, limit=limit)
         return {"count": len(high_risk), "threshold": threshold, "sessions": high_risk}
@@ -866,12 +807,7 @@ async def get_high_risk_sessions(
 
 @app.get("/cache-stats")
 async def get_cache_stats():
-    """
-    Get Redis cache statistics
-
-    Returns:
-        dict: Cache health and statistics
-    """
+    """Get Redis cache statistics"""
     try:
         return state_sync.get_cache_stats()
     except Exception as e:
@@ -881,15 +817,7 @@ async def get_cache_stats():
 
 @app.post("/sync-to-database", dependencies=[Depends(require_token)])
 async def sync_cache_to_database(session_id: str | None = None):
-    """
-    Manually sync cache to database
-
-    Args:
-        session_id: Specific session to sync, or None to sync all active sessions
-
-    Returns:
-        dict: Sync result
-    """
+    """Manually sync cache to database"""
     try:
         if session_id:
             session_data = state_sync.get_session_state(session_id)
@@ -897,7 +825,7 @@ async def sync_cache_to_database(session_id: str | None = None):
                 state_sync.sync_state_to_db(session_id, session_data)
                 return {"message": f"Synced session {session_id}", "status": "success"}
             raise HTTPException(status_code=404, detail="Session not found in cache")
-        # Sync all active sessions
+
         active_sessions = state_sync.get_active_sessions()
         for sid in active_sessions:
             session_data = state_sync.get_session_state(sid)
@@ -918,14 +846,7 @@ async def sync_cache_to_database(session_id: str | None = None):
 
 @app.delete("/clear-cache", dependencies=[Depends(require_token)])
 async def clear_session_cache():
-    """
-    Clear all session cache from Redis
-
-    WARNING: This will clear all cached session states
-
-    Returns:
-        dict: Clear operation result
-    """
+    """Clear all session cache from Redis"""
     try:
         logger.warning("Clearing all session cache from Redis")
         result = state_sync.clear_cache()
@@ -941,10 +862,7 @@ async def list_interviews(
     status: str | None = None,
     session_db: Session = Depends(get_db),
 ):
-    """
-    List interview sessions, newest first.
-    """
-
+    """List interview sessions, newest first."""
     stmt = select(InterviewSession)
 
     if status:
@@ -1244,22 +1162,12 @@ async def submit_answer(
 
 @app.post("/register-worker", dependencies=[Depends(require_token)])
 async def register_worker(request: WorkerRegistrationRequest):
-    """
-    Register a new worker node
-
-    Args:
-        request: Worker registration details (worker_id, capacity)
-
-    Returns:
-        dict: Registration confirmation
-    """
+    """Register a new worker node"""
     try:
         logger.info(f"Registering worker: {request.worker_id} with capacity {request.capacity}")
 
-        # Register worker in registry
         worker_registry.register_worker(worker_id=request.worker_id, capacity=request.capacity)
 
-        # Log successful registration
         logger.info(f"Worker registered successfully: {request.worker_id}")
         WORKERS_REGISTERED.inc()
         WORKERS_HEALTHY.inc()
@@ -1278,37 +1186,20 @@ async def register_worker(request: WorkerRegistrationRequest):
 
 @app.post("/worker/heartbeat", dependencies=[Depends(require_token)])
 async def worker_heartbeat(request: WorkerHeartbeatRequest):
-    """
-    Process heartbeat from worker node
-
-    Workers send periodic heartbeats to indicate they are alive
-    and to report current active task count
-
-    Args:
-        request: Heartbeat data (worker_id, active_tasks)
-
-    Returns:
-        dict: Heartbeat confirmation
-    """
+    """Process heartbeat from worker node"""
     try:
         logger.debug(f"Heartbeat from worker: {request.worker_id} (active_tasks: {request.active_tasks})")
 
-        # Update worker heartbeat in registry
         worker_registry.heartbeat(worker_id=request.worker_id, active_tasks=request.active_tasks)
         WORKER_HEARTBEAT_AGE_SECONDS.labels(worker_id=request.worker_id).set(0)
-
         WORKER_ACTIVE_TASKS.labels(worker_id=request.worker_id).set(request.active_tasks)
 
         worker_status = worker_registry.get_worker(request.worker_id)
         if worker_status:
-          WORKER_CAPACITY.labels(worker_id=request.worker_id).set(worker_status.get("capacity", 0))
+            WORKER_CAPACITY.labels(worker_id=request.worker_id).set(worker_status.get("capacity", 0))
 
-
-        # Invalidate the workers + load caches so the next dashboard poll is fresh.
         http_cache.invalidate("workers", "worker-statistics", "load-status")
 
-        # Get worker health status
-        worker_status = worker_registry.get_worker(request.worker_id)
         health_status = (
             "healthy" if worker_status and worker_status.get("health_status") == "healthy" else "unknown"
         )
@@ -1329,22 +1220,13 @@ async def worker_heartbeat(request: WorkerHeartbeatRequest):
 @app.get("/workers")
 @http_cache.cached("workers", ttl=2)
 async def list_workers():
-    """
-    Get list of all registered workers with status
-
-    Returns:
-        dict: Worker nodes with status information
-    """
+    """Get list of all registered workers with status"""
     try:
         logger.debug("Fetching worker list")
 
-        # Get all workers from registry
         all_workers = worker_registry.get_all_workers()
-
-        # Detect unhealthy workers (no heartbeat for timeout period)
         unhealthy = worker_registry.detect_unhealthy_workers()
 
-        # Build worker list with status
         workers_list = []
         for worker_id, worker_data in all_workers.items():
             is_healthy = worker_id not in unhealthy
@@ -1375,19 +1257,12 @@ async def list_workers():
 @app.get("/worker-statistics")
 @http_cache.cached("worker-statistics", ttl=2)
 async def get_worker_stats():
-    """
-    Get detailed worker statistics and utilization metrics
-
-    Returns:
-        dict: Worker utilization and performance metrics
-    """
+    """Get detailed worker statistics and utilization metrics"""
     try:
         logger.debug("Generating worker statistics")
 
-        # Get worker statistics
         stats = worker_registry.get_worker_statistics()
 
-        # Calculate aggregate metrics
         total_capacity = stats.get("total_capacity", 0)
         total_active = stats.get("total_active_tasks", 0)
         utilization = (total_active / total_capacity * 100) if total_capacity > 0 else 0
@@ -1411,22 +1286,10 @@ async def get_worker_stats():
 
 @app.get("/load-status")
 async def get_load_status():
-    """
-    Get current system load and capacity status
-
-    Provides visualization of:
-    - Overall system utilization
-    - Queue depth
-    - Worker availability
-    - Load balancer strategy recommendations
-
-    Returns:
-        dict: System load information
-    """
+    """Get current system load and capacity status"""
     try:
         logger.debug("Fetching system load status")
 
-        # Get load status from load balancer
         load_status = load_balancer.get_load_status()
 
         return {
@@ -1447,16 +1310,10 @@ async def get_load_status():
 
 @app.get("/scheduling-status")
 async def get_scheduling_status():
-    """
-    Get scheduler status and health information
-
-    Returns:
-        dict: Scheduler operational status and metrics
-    """
+    """Get scheduler status and health information"""
     try:
         logger.debug("Fetching scheduler status")
 
-        # Get scheduling status
         status_info = scheduler.get_scheduling_status()
 
         return {
@@ -1475,24 +1332,10 @@ async def get_scheduling_status():
 
 @app.post("/switch-strategy", dependencies=[Depends(require_token)])
 async def switch_load_balancing_strategy(strategy: str):
-    """
-    Change the active load balancing strategy
-
-    Supported strategies:
-    - ROUND_ROBIN: Sequential worker assignment (even task distribution)
-    - LEAST_LOADED: Assign to worker with fewest active tasks (recommended)
-    - QUEUE_BASED: Use Redis queue length as selection metric
-
-    Args:
-        strategy: Strategy name (ROUND_ROBIN, LEAST_LOADED, QUEUE_BASED)
-
-    Returns:
-        dict: Strategy change confirmation
-    """
+    """Change the active load balancing strategy"""
     try:
         logger.info(f"Switching load balancing strategy to: {strategy}")
 
-        # Validate strategy
         valid_strategies = {
             "ROUND_ROBIN": BalancingStrategy.ROUND_ROBIN,
             "LEAST_LOADED": BalancingStrategy.LEAST_LOADED,
@@ -1505,7 +1348,6 @@ async def switch_load_balancing_strategy(strategy: str):
                 detail=f"Invalid strategy. Valid options: {', '.join(valid_strategies.keys())}",
             )
 
-        # Switch strategy
         new_strategy = valid_strategies[strategy.upper()]
         load_balancer.switch_strategy(new_strategy)
 
@@ -1527,21 +1369,10 @@ async def switch_load_balancing_strategy(strategy: str):
 
 @app.delete("/deregister-worker/{worker_id}", dependencies=[Depends(require_token)])
 async def deregister_worker(worker_id: str):
-    """
-    Deregister a worker node (remove from active pool)
-
-    Use this when a worker is permanently removed from the system
-
-    Args:
-        worker_id: ID of worker to deregister
-
-    Returns:
-        dict: Deregistration confirmation
-    """
+    """Deregister a worker node (remove from active pool)"""
     try:
         logger.info(f"Deregistering worker: {worker_id}")
 
-        # Deregister worker
         worker_registry.deregister_worker(worker_id)
 
         logger.info(f"Worker deregistered successfully: {worker_id}")
@@ -1563,19 +1394,10 @@ async def deregister_worker(worker_id: str):
 @app.get("/failed-sessions")
 @http_cache.cached("failed-sessions", ttl=3)
 async def get_failed_sessions(limit: int = 100):
-    """
-    Get sessions that failed during processing
-
-    Args:
-        limit: Maximum number of failed sessions to return
-
-    Returns:
-        dict: List of failed sessions with details
-    """
+    """Get sessions that failed during processing"""
     try:
         logger.debug("Fetching failed sessions")
 
-        # Get from session tracker
         failed = session_tracker.get_failed_sessions(limit=limit)
 
         return {
@@ -1590,32 +1412,17 @@ async def get_failed_sessions(limit: int = 100):
 
 @app.post("/retry-session/{session_id}", dependencies=[Depends(require_token)])
 async def retry_failed_session(session_id: str):
-    """
-    Retry a failed interview session
-
-    Attempts to reschedule the session if it hasn't exceeded max retries.
-
-    Args:
-        session_id: ID of session to retry
-
-    Returns:
-        dict: Retry scheduling result
-    """
+    """Retry a failed interview session"""
     try:
         logger.info(f"Retry request for session: {session_id}")
 
-        # Check if can retry
         if not retry_manager.can_retry(session_id):
             raise HTTPException(
                 status_code=400,
                 detail=f"Session {session_id} has exceeded maximum retry attempts",
             )
 
-        # Get retry info
         retry_info = retry_manager.get_retry_info(session_id)
-
-        # Schedule retry with exponential backoff
-        # Schedule retry
         retry_scheduled = retry_manager.schedule_retry(session_id)
 
         if not retry_scheduled:
@@ -1624,9 +1431,6 @@ async def retry_failed_session(session_id: str):
                 detail=f"Failed to schedule retry for session {session_id}",
             )
 
-        # -----------------------------
-        # Actually requeue the interview
-        # -----------------------------
         from orchestrator.scheduler import TaskPriority
 
         scheduler.schedule_task(
@@ -1655,22 +1459,10 @@ async def retry_failed_session(session_id: str):
 
 @app.get("/system-health")
 async def get_system_health():
-    """
-    Get comprehensive system health status
-
-    Performs health checks on:
-    - Redis connectivity
-    - Worker nodes
-    - Active sessions
-    - Queue backlog
-
-    Returns:
-        dict: System health status and metrics
-    """
+    """Get comprehensive system health status"""
     try:
         logger.debug("Performing system health check")
 
-        # Perform comprehensive health check
         return health_monitor.check_system_health(
             worker_registry=worker_registry, session_manager=session_manager
         )
@@ -1682,16 +1474,10 @@ async def get_system_health():
 
 @app.get("/worker-health")
 async def get_worker_health():
-    """
-    Get detailed health status of all workers
-
-    Returns:
-        dict: Worker health information
-    """
+    """Get detailed health status of all workers"""
     try:
         logger.debug("Fetching worker health status")
 
-        # Check worker health
         return health_monitor.check_worker_health(worker_registry)
 
     except Exception as e:
@@ -1701,15 +1487,7 @@ async def get_worker_health():
 
 @app.get("/recovery-queue")
 async def get_recovery_queue(limit: int = 50):
-    """
-    Get sessions queued for recovery/retry
-
-    Args:
-        limit: Maximum number to return
-
-    Returns:
-        dict: Recovery queue entries
-    """
+    """Get sessions queued for recovery/retry"""
     try:
         logger.debug("Fetching recovery queue")
 
@@ -1727,15 +1505,7 @@ async def get_recovery_queue(limit: int = 50):
 
 @app.get("/failure-log")
 async def get_failure_log(limit: int = 100):
-    """
-    Get system failure log entries
-
-    Args:
-        limit: Maximum number of entries to return
-
-    Returns:
-        dict: Failure log entries
-    """
+    """Get system failure log entries"""
     try:
         logger.debug("Fetching failure log")
 
@@ -1753,15 +1523,7 @@ async def get_failure_log(limit: int = 100):
 
 @app.get("/dead-letter-queue")
 async def get_dead_letter_queue(limit: int = 50):
-    """
-    Get permanently failed sessions in dead letter queue
-
-    Args:
-        limit: Maximum number to return
-
-    Returns:
-        dict: Dead letter queue entries
-    """
+    """Get permanently failed sessions in dead letter queue"""
     try:
         logger.debug("Fetching dead letter queue")
 
@@ -1779,12 +1541,7 @@ async def get_dead_letter_queue(limit: int = 50):
 
 @app.get("/fault-statistics")
 async def get_fault_statistics():
-    """
-    Get aggregate fault and recovery statistics
-
-    Returns:
-        dict: System fault metrics and trends
-    """
+    """Get aggregate fault and recovery statistics"""
     try:
         logger.debug("Generating fault statistics")
 
@@ -1803,32 +1560,14 @@ async def get_fault_statistics():
 
 @app.post("/detect-failures", dependencies=[Depends(require_token)])
 async def detect_and_handle_failures():
-    """
-    Manually trigger failure detection and recovery
-
-    Scans for:
-    - Failed sessions (stuck in PROCESSING)
-    - Unhealthy workers
-    - Stuck sessions
-
-    Triggers recovery for detected failures.
-
-    Returns:
-        dict: Detection and recovery results
-    """
+    """Manually trigger failure detection and recovery"""
     try:
         logger.info("Manual failure detection triggered")
 
-        # Detect failed sessions
         failed_sessions = fault_manager.detect_failed_sessions()
-
-        # Detect unhealthy workers
         unhealthy_workers = health_monitor.detect_worker_failures(worker_registry)
-
-        # Detect stuck sessions
         stuck_sessions = health_monitor.detect_stuck_sessions(session_manager)
 
-        # Handle worker failures
         handled = 0
         for worker_id in unhealthy_workers:
             if fault_manager.handle_worker_failure(worker_id, "Detected as unhealthy"):
@@ -1851,7 +1590,6 @@ async def detect_and_handle_failures():
             f"{len(unhealthy_workers)} unhealthy workers, {len(stuck_sessions)} stuck"
         )
 
-        # Drop every cache so dashboards reflect the recovery pass.
         http_cache.invalidate()
 
         return results
@@ -1935,12 +1673,7 @@ async def get_moment_analytics(time_range_hours: int = 24):
 
 @app.get("/dashboard")
 async def get_dashboard():
-    """
-    Serve the monitoring dashboard HTML
-
-    Returns:
-        HTML content of the dashboard
-    """
+    """Serve the monitoring dashboard HTML"""
     try:
         import os
 
