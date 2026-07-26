@@ -38,7 +38,7 @@ from config import (
     MAX_REQUEST_BODY_BYTES,
 )
 from database.db import engine, get_db
-from database.models import Base, Candidate, InterviewSession
+from database.models import Base, InterviewSession
 from monitoring.dashboard_api import create_dashboard_routes
 from monitoring.metrics_collector import MetricsCollector
 from monitoring.prometheus_metrics import (
@@ -336,63 +336,6 @@ class SessionStatusResponse(BaseModel):
     start_time: str | None = None
     end_time: str | None = None
     updated_at: str | None = None
-
-
-class ReportCandidate(BaseModel):
-    candidate_id: str
-    name: str
-    email: str
-
-
-class ReportInterviewSummary(BaseModel):
-    start_time: str | None = None
-    end_time: str | None = None
-    duration_minutes: float | None = None
-
-
-class ReportQuestion(BaseModel):
-    question_id: str
-    text: str
-    answer: str | None = None
-    score: float | None = None
-    feedback: str | None = None
-
-
-class ReportEvaluation(BaseModel):
-    quality: float | None = None
-    accuracy: float | None = None
-    clarity: float | None = None
-
-
-class ReportLLMFeedback(BaseModel):
-    strengths: list[str] = Field(default_factory=list)
-    improvements: list[str] = Field(default_factory=list)
-    recommendation: str | None = None
-    detailed_feedback: str | None = None
-
-
-class ReportRiskAssessment(BaseModel):
-    score: float | None = None
-    classification: str | None = None
-    factors: list[str] = Field(default_factory=list)
-
-
-class ReportMetadata(BaseModel):
-    token_usage: int | None = None
-    estimated_cost_usd: float | None = None
-
-
-class InterviewReportResponse(BaseModel):
-    """Comprehensive final interview report"""
-
-    session_id: str
-    candidate: ReportCandidate
-    interview_summary: ReportInterviewSummary
-    questions: list[ReportQuestion] = Field(default_factory=list)
-    overall_evaluation: ReportEvaluation
-    llm_feedback: ReportLLMFeedback
-    risk_assessment: ReportRiskAssessment
-    metadata: ReportMetadata
 
 
 class TaskStatusResponse(BaseModel):
