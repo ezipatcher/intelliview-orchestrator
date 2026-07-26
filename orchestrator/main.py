@@ -11,6 +11,7 @@ Integrates:
 - Worker Registry for node tracking
 - Task Queue integration with Celery
 """
+import asyncio
 import json
 import io
 import logging
@@ -617,12 +618,29 @@ async def stream_evaluation(session_id: str):
 
     async def event_generator():
         try:
+            # Get the synchronous generator
             token_gen = chat_completion(messages=messages, stream=True)
             if token_gen is None:
                 yield f"data: {json.dumps({'error': 'LLM provider unavailable', 'status': 'FAILED'})}\n\n"
                 return
 
-            for token in token_gen:
+            # Safely iterate the sync generator in an async context
+            def get_next_token():
+                try:
+                    return next(token_gen)
+                except StopIteration:
+                    return None
+
+            while True:
+                # Offload the blocking network call to a background thread
+                token = await asyncio.to_thread(get_next_token)
+                if token is None:
+                    break
+                
+                # Broadcast to the dashboard via WebSocket!
+                await ws_manager.broadcast_evaluation_token(session_id, token)
+                
+                # Yield to the SSE client
                 yield f"data: {json.dumps({'token': token})}\n\n"
 
             yield f"data: {json.dumps({'status': 'DONE'})}\n\n"
